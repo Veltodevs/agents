@@ -343,6 +343,38 @@ class RealtimeModel(llm.RealtimeModel):
                 tool_response_scheduling=self._opts.tool_response_scheduling,
             )
 
+    def inject_silent_context(self, user_message: str, assistant_message: str, context_logger=None, turn_complete=True) -> None:
+        """
+        Inject context into ALL active Gemini sessions SILENTLY.
+        
+        This delegates to the underlying RealtimeSession.inject_silent_context()
+        method, which uses Google's send_client_content API.
+        
+        Args:
+            user_message: The simulated user message
+            assistant_message: The simulated assistant response
+            context_logger: Optional ContextLogger for diagnostic logging (TEMPORARY)
+            turn_complete: If True, signals turn is complete (agent may respond). 
+                          If False, agent should stay silent (position updates).
+        
+        Example:
+            # Product awareness (agent may speak)
+            model.inject_silent_context(
+                user_message="Show me jackets",
+                assistant_message="Product 1: Classic Leather Jacket\\n...",
+                turn_complete=True
+            )
+            
+            # Position update (agent stays silent)
+            model.inject_silent_context(
+                user_message="[User scrolled]",
+                assistant_message="Position: Product #2",
+                turn_complete=False
+            )
+        """
+        for sess in self._sessions:
+            sess.inject_silent_context(user_message, assistant_message, context_logger=context_logger, turn_complete=turn_complete)
+
     async def aclose(self) -> None:
         pass
 
@@ -597,6 +629,165 @@ class RealtimeSession(llm.RealtimeSession):
 
         return fut
 
+    def _prune_stale_display_context(self) -> None:
+        """
+        Remove old CURRENT DISPLAY STATE and POSITION UPDATE injections from chat context.
+        
+        This prevents context accumulation that causes hallucination. When the user asks
+        to see NEW products, we remove the old product details but keep the agent's spoken
+        responses (which are part of the actual conversation flow).
+        
+        Markers to identify silent injections:
+        - User messages starting with: "The user just asked to search"
+        - Assistant messages starting with: "=== CURRENT DISPLAY STATE ===" or "=== POSITION UPDATE ==="
+        - User messages containing: "[User is now browsing]" or "[User scrolled to"
+        """
+        original_count = len(self._chat_ctx.items)
+        
+        # Filter out silent injection messages
+        self._chat_ctx.items = [
+            item for item in self._chat_ctx.items 
+            if not (
+                item.type == "message" and 
+                item.text_content and (
+                    item.text_content.startswith("The user just asked to search") or
+                    item.text_content.startswith("=== CURRENT DISPLAY STATE ===") or
+                    item.text_content.startswith("=== POSITION UPDATE ===") or
+                    "[User is now browsing]" in item.text_content or
+                    "[User scrolled to" in item.text_content
+                )
+            )
+        ]
+        
+        pruned_count = original_count - len(self._chat_ctx.items)
+        if pruned_count > 0:
+            logger.info(f"🗑️ [CONTEXT PRUNING] Removed {pruned_count} stale display context message(s)")
+            logger.info(f"📊 [CONTEXT PRUNING] Context size: {original_count} → {len(self._chat_ctx.items)} items")
+
+    def inject_silent_context(self, user_message: str, assistant_message: str, context_logger=None, turn_complete=True) -> None:
+        """
+        Inject context into Gemini session.
+        
+        ⚠️ CRITICAL FIX FOR AUDIO MODE:
+        In AUDIO mode, turn_complete=False may not commit context consistently.
+        For position updates, we use turn_complete=False to prevent speech.
+        For product awareness, we use turn_complete=True with a 3-turn structure.
+        
+        ⚠️ ANTI-HALLUCINATION FIX:
+        Before injecting new context, we prune old "CURRENT DISPLAY STATE" messages to prevent
+        the agent from seeing stale product data and hallucinating about products that are no
+        longer on screen. The agent's actual spoken responses are preserved.
+        
+        Args:
+            user_message: The simulated user message (e.g., "Show me jackets")
+            assistant_message: The simulated assistant response (e.g., full product data)
+            context_logger: Optional ContextLogger for diagnostic logging (TEMPORARY)
+            turn_complete: If True, signals turn is complete (agent may respond).
+                          If False, agent should stay silent (position updates).
+        
+        Example:
+            # Product awareness (agent may speak)
+            session.inject_silent_context(
+                user_message="Show me jackets",
+                assistant_message="Product 1: Classic Leather Jacket\\n...",
+                turn_complete=True
+            )
+            
+            # Position update (agent stays silent)
+            session.inject_silent_context(
+                user_message="[User scrolled]",
+                assistant_message="Position: Product #2\\n\\n[SYSTEM: DO NOT speak. Wait for user.]",
+                turn_complete=False
+            )
+        """
+        logger.info(f"🔍 [DEBUG] inject_silent_context called - session active: {self._active_session is not None}")
+        logger.info(f"🔍 [DEBUG] _chat_ctx items before pruning: {len(self._chat_ctx.items)}")
+        
+        # 📊 TEMP LOGGING: Capture chat context BEFORE pruning
+        chat_ctx_before = None
+        if context_logger:
+            try:
+                chat_ctx_before = []
+                for item in self._chat_ctx.items:
+                    # ✅ FIX: Safely handle different item types (message, function_call, function_call_output)
+                    item_data = {"type": item.type, "role": getattr(item, 'role', None)}
+                    if hasattr(item, 'text_content') and item.text_content:
+                        item_data["text"] = item.text_content[:200]
+                    elif item.type == "function_call":
+                        item_data["function"] = getattr(item, 'name', 'unknown')
+                    elif item.type == "function_call_output":
+                        item_data["function"] = getattr(item, 'name', 'unknown')
+                        item_data["output"] = str(getattr(item, 'output', ''))[:100]
+                    chat_ctx_before.append(item_data)
+            except Exception as e:
+                logger.error(f"Context logging error (before): {e}")
+        
+        # ✅ PRUNE old display context BEFORE injecting new context
+        # This prevents hallucination by removing stale product data
+        self._prune_stale_display_context()
+        
+        logger.info(f"🔍 [DEBUG] _chat_ctx items after pruning, before injection: {len(self._chat_ctx.items)}")
+        
+        # ✅ CONFIGURABLE turn_complete:
+        # - turn_complete=True: 3-turn structure for full awareness (agent may speak)
+        # - turn_complete=False: Try to prevent speech (for position updates)
+        if turn_complete:
+            # Full awareness: 3-turn structure to prevent unwanted speech while committing context
+            turns = [
+                types.Content(parts=[types.Part(text=user_message)], role="user"),
+                types.Content(parts=[types.Part(text=assistant_message)], role="model"),
+                types.Content(parts=[types.Part(text="[User is now browsing]")], role="user"),
+            ]
+        else:
+            # Position update: 2-turn structure, turn_complete=False to stay silent
+            turns = [
+                types.Content(parts=[types.Part(text=user_message)], role="user"),
+                types.Content(parts=[types.Part(text=assistant_message)], role="model"),
+            ]
+        
+        self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=turn_complete))
+        
+        # ✅ CRITICAL: Also update local _chat_ctx so LiveKit knows about the injected context!
+        # Without this, the context is sent to Gemini but LiveKit's internal state doesn't match,
+        # which can cause context loss when subsequent messages are processed.
+        self._chat_ctx.add_message(role="user", content=user_message)
+        self._chat_ctx.add_message(role="assistant", content=assistant_message)
+        if turn_complete:
+            # Only add 3rd turn if turn_complete=True
+            self._chat_ctx.add_message(role="user", content="[User is now browsing]")
+        
+        # 📊 TEMP LOGGING: Capture chat context AFTER injection
+        if context_logger:
+            try:
+                chat_ctx_after = []
+                for item in self._chat_ctx.items:
+                    # ✅ FIX: Safely handle different item types (message, function_call, function_call_output)
+                    item_data = {"type": item.type, "role": getattr(item, 'role', None)}
+                    if hasattr(item, 'text_content') and item.text_content:
+                        item_data["text"] = item.text_content[:200]
+                    elif item.type == "function_call":
+                        item_data["function"] = getattr(item, 'name', 'unknown')
+                    elif item.type == "function_call_output":
+                        item_data["function"] = getattr(item, 'name', 'unknown')
+                        item_data["output"] = str(getattr(item, 'output', ''))[:100]
+                    chat_ctx_after.append(item_data)
+                    
+                context_logger.log_silent_injection(
+                    user_message=user_message,
+                    assistant_message=assistant_message[:1000],  # Truncate for readability
+                    chat_ctx_before=str(chat_ctx_before),
+                    chat_ctx_after=str(chat_ctx_after)
+                )
+            except Exception as e:
+                logger.error(f"Context logging error (after): {e}")
+        
+        logger.info(f"✅ Injected silent context with turn_complete={turn_complete}: {len(user_message) + len(assistant_message)} chars")
+        logger.info(f"🔍 [DEBUG] _chat_ctx items after injection: {len(self._chat_ctx.items)}")
+        if turn_complete:
+            logger.info(f"🎯 [FULL AWARENESS] Using turn_complete=True with 3-turn structure (agent may respond)")
+        else:
+            logger.info(f"🔇 [SILENT UPDATE] Using turn_complete=False with 2-turn structure (agent should stay silent)")
+
     def start_user_activity(self) -> None:
         if not self._manual_activity_detection:
             return
@@ -669,15 +860,20 @@ class RealtimeSession(llm.RealtimeSession):
                 ) as session:
                     async with self._session_lock:
                         self._active_session = session
+                        logger.info(f"🔍 [DEBUG] Session connected - initializing with {len(self._chat_ctx.items)} _chat_ctx items")
                         turns_dict, _ = self._chat_ctx.copy(
                             exclude_function_call=True,
                         ).to_provider_format(format="google", inject_dummy_user_message=False)
                         if turns_dict:
                             turns = [types.Content.model_validate(turn) for turn in turns_dict]
+                            logger.info(f"🔍 [DEBUG] Sending {len(turns)} initial turns to Gemini (turn_complete=False)")
                             await session.send_client_content(
                                 turns=turns,  # type: ignore
                                 turn_complete=False,
                             )
+                            logger.info(f"✅ [DEBUG] Initial context sent to Gemini successfully")
+                        else:
+                            logger.info(f"🔍 [DEBUG] No initial turns to send - _chat_ctx was empty")
                     # queue up existing chat context
                     send_task = asyncio.create_task(
                         self._send_task(session), name="gemini-realtime-send"
@@ -742,10 +938,21 @@ class RealtimeSession(llm.RealtimeSession):
                     ):
                         break
                 if isinstance(msg, types.LiveClientContent):
+                    logger.info(f"🔍 [DEBUG] Sending LiveClientContent to Gemini: {len(msg.turns)} turns, turn_complete={msg.turn_complete}")
+                    for i, turn in enumerate(msg.turns):
+                        role = turn.role
+                        text_content = ""
+                        if turn.parts:
+                            for part in turn.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    text_content = part.text[:100]  # First 100 chars
+                        logger.info(f"🔍 [DEBUG]   Turn {i+1}: role={role}, content={text_content}...")
+                    
                     await session.send_client_content(
                         turns=msg.turns,  # type: ignore
                         turn_complete=msg.turn_complete,
                     )
+                    logger.info(f"✅ [DEBUG] Successfully sent LiveClientContent to Gemini")
                 elif isinstance(msg, types.LiveClientToolResponse) and msg.function_responses:
                     await session.send_tool_response(function_responses=msg.function_responses)
                 elif isinstance(msg, types.LiveClientRealtimeInput):
