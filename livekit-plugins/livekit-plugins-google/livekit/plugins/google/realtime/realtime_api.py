@@ -349,7 +349,8 @@ class RealtimeModel(llm.RealtimeModel):
         assistant_message: str, 
         context_logger=None, 
         turn_complete=True,
-        final_user_context: str = "[User is now browsing]"
+        final_user_context: str = "[User is now browsing]",
+        final_turn_role: str = "user"
     ) -> None:
         """
         Inject context into ALL active Gemini sessions SILENTLY.
@@ -364,13 +365,17 @@ class RealtimeModel(llm.RealtimeModel):
             turn_complete: If True, signals turn is complete (agent may respond). 
                           If False, agent should stay silent (position updates).
             final_user_context: Custom 3rd turn message (default: "[User is now browsing]")
+            final_turn_role: The role of the final turn when turn_complete=True.
+                            "user" = 3-turn structure ending with user message (agent may speak)
+                            "model" = 2-turn structure ending with assistant message (agent silent)
         
         Example:
             # Product awareness (agent may speak)
             model.inject_silent_context(
                 user_message="Show me jackets",
                 assistant_message="Product 1: Classic Leather Jacket\\n...",
-                turn_complete=True
+                turn_complete=True,
+                final_turn_role="user"
             )
             
             # Position update (agent stays silent)
@@ -379,6 +384,14 @@ class RealtimeModel(llm.RealtimeModel):
                 assistant_message="Position: Product #2",
                 turn_complete=False
             )
+            
+            # Fitting room awareness (agent silent)
+            model.inject_silent_context(
+                user_message="I've added items to my fitting room. Can you acknowledge?",
+                assistant_message="Understood. I'm aware of your fitting room items.",
+                turn_complete=True,
+                final_turn_role="model"  # Agent stays silent!
+            )
         """
         for sess in self._sessions:
             sess.inject_silent_context(
@@ -386,7 +399,8 @@ class RealtimeModel(llm.RealtimeModel):
                 assistant_message, 
                 context_logger=context_logger, 
                 turn_complete=turn_complete,
-                final_user_context=final_user_context
+                final_user_context=final_user_context,
+                final_turn_role=final_turn_role
             )
 
     async def aclose(self) -> None:
@@ -684,7 +698,8 @@ class RealtimeSession(llm.RealtimeSession):
         assistant_message: str, 
         context_logger=None, 
         turn_complete=True,
-        final_user_context: str = "[User is now browsing]"
+        final_user_context: str = "[User is now browsing]",
+        final_turn_role: str = "user"
     ) -> None:
         """
         Inject context into Gemini session.
@@ -705,16 +720,21 @@ class RealtimeSession(llm.RealtimeSession):
             context_logger: Optional ContextLogger for diagnostic logging (TEMPORARY)
             turn_complete: If True, signals turn is complete (agent may respond).
                           If False, agent should stay silent (position updates).
-            final_user_context: The 3rd turn message when turn_complete=True.
+            final_user_context: The 3rd turn message when turn_complete=True AND final_turn_role="user".
                                Defaults to "[User is now browsing]" for product awareness.
                                Can be customized for specific contexts (e.g., try-on announcements).
+            final_turn_role: The role of the final turn when turn_complete=True.
+                            "user" = 3-turn structure ending with user message (agent may speak)
+                            "model" = 2-turn structure ending with assistant message (agent silent)
+                            Defaults to "user" for backward compatibility.
         
         Example:
             # Product awareness (agent may speak)
             session.inject_silent_context(
                 user_message="Show me jackets",
                 assistant_message="Product 1: Classic Leather Jacket\\n...",
-                turn_complete=True
+                turn_complete=True,
+                final_turn_role="user"  # Agent may speak
             )
             
             # Position update (agent stays silent)
@@ -729,7 +749,16 @@ class RealtimeSession(llm.RealtimeSession):
                 user_message="[TRYON COMPLETE] Your outfit is ready!",
                 assistant_message="",
                 turn_complete=True,
-                final_user_context="[TRYON COMPLETE] Classic Leather Jacket"
+                final_user_context="[TRYON COMPLETE] Classic Leather Jacket",
+                final_turn_role="user"  # Agent speaks the announcement
+            )
+            
+            # Fitting room awareness (agent silent)
+            session.inject_silent_context(
+                user_message="I've added items to my fitting room: Classic Jacket, Navy Blazer. Can you acknowledge?",
+                assistant_message="Understood. I'm aware of your fitting room items and ready to answer questions.",
+                turn_complete=True,
+                final_turn_role="model"  # Agent stays silent! Last message is assistant's acknowledgment
             )
         """
         logger.info(f"🔍 [DEBUG] inject_silent_context called - session active: {self._active_session is not None}")
@@ -760,19 +789,21 @@ class RealtimeSession(llm.RealtimeSession):
         
         logger.info(f"🔍 [DEBUG] _chat_ctx items after pruning, before injection: {len(self._chat_ctx.items)}")
         
-        # ✅ CONFIGURABLE turn_complete:
-        # - turn_complete=True: 3-turn structure for full awareness (agent may speak)
-        # - turn_complete=False: Try to prevent speech (for position updates)
-        if turn_complete:
-            # Full awareness: 3-turn structure to prevent unwanted speech while committing context
-            # ✅ NEW: Uses final_user_context parameter (customizable 3rd turn message)
+        # ✅ CONFIGURABLE turn_complete and final_turn_role:
+        # - turn_complete=False: 2-turn structure (for position updates, agent stays silent)
+        # - turn_complete=True + final_turn_role="user": 3-turn structure (agent may speak)
+        # - turn_complete=True + final_turn_role="model": 2-turn structure (agent silent, awareness only)
+        if turn_complete and final_turn_role == "user":
+            # Full awareness: 3-turn structure ending with user message (agent may speak)
+            # ✅ Uses final_user_context parameter (customizable 3rd turn message)
             turns = [
                 types.Content(parts=[types.Part(text=user_message)], role="user"),
                 types.Content(parts=[types.Part(text=assistant_message)], role="model"),
                 types.Content(parts=[types.Part(text=final_user_context)], role="user"),
             ]
         else:
-            # Position update: 2-turn structure, turn_complete=False to stay silent
+            # Position update OR silent awareness: 2-turn structure ending with assistant message
+            # Agent stays silent because last message is from assistant
             turns = [
                 types.Content(parts=[types.Part(text=user_message)], role="user"),
                 types.Content(parts=[types.Part(text=assistant_message)], role="model"),
@@ -785,9 +816,9 @@ class RealtimeSession(llm.RealtimeSession):
         # which can cause context loss when subsequent messages are processed.
         self._chat_ctx.add_message(role="user", content=user_message)
         self._chat_ctx.add_message(role="assistant", content=assistant_message)
-        if turn_complete:
-            # Only add 3rd turn if turn_complete=True
-            # ✅ NEW: Uses final_user_context parameter (customizable 3rd turn message)
+        if turn_complete and final_turn_role == "user":
+            # Only add 3rd turn if turn_complete=True AND final_turn_role="user"
+            # ✅ Uses final_user_context parameter (customizable 3rd turn message)
             self._chat_ctx.add_message(role="user", content=final_user_context)
         
         # 📊 TEMP LOGGING: Capture chat context AFTER injection
