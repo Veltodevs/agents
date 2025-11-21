@@ -402,6 +402,26 @@ class RealtimeModel(llm.RealtimeModel):
                 final_user_context=final_user_context,
                 final_turn_role=final_turn_role
             )
+    
+    def push_video(self, frame: rtc.VideoFrame) -> None:
+        """
+        🎨 FEATURE 4: Push video frame to all active sessions for vision analysis.
+        
+        Delegates to all RealtimeSession instances belonging to this model,
+        following the same pattern as inject_silent_context().
+        
+        This enables the agent to visually analyze images (e.g., virtual try-on results)
+        and provide specific, visual feedback to the user.
+        
+        SECURITY: Only sends to sessions belonging to THIS model instance.
+        Each user has their own isolated RealtimeModel, so cross-user
+        contamination is impossible.
+        
+        Args:
+            frame: LiveKit VideoFrame to send to Gemini for visual analysis
+        """
+        for sess in self._sessions:
+            sess.push_video(frame)
 
     async def aclose(self) -> None:
         pass
